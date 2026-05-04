@@ -1293,6 +1293,138 @@ async def test_dynamic_toolset_outside_workflow():
     assert result.output == snapshot('{"get_dynamic_weather":"Weather in a for Bob: sunny."}')
 
 
+def return_instructions(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(agent_info.instructions or '')])
+
+
+def return_dynamic_toolset_instructions(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    if len(messages) == 1:
+        return ModelResponse(parts=[ToolCallPart('dynamic_tool', {})])
+
+    last_message = messages[-1]
+    assert isinstance(last_message, ModelRequest)
+    tool_return = last_message.parts[0]
+    assert isinstance(tool_return, ToolReturnPart)
+    return ModelResponse(parts=[TextPart(f'{agent_info.instructions or ""}:{tool_return.content}')])
+
+
+dynamic_toolset_instructions_agent = Agent(
+    FunctionModel(return_dynamic_toolset_instructions), name='dynamic_toolset_instructions_agent'
+)
+
+
+@dynamic_toolset_instructions_agent.toolset(id='dynamic_instruction_toolset', per_run_step=False)
+async def my_dynamic_instruction_toolset(ctx: RunContext[None]) -> FunctionToolset[None]:
+    toolset = FunctionToolset[None](
+        id='dynamic_instruction_tools',
+        instructions='IMPORTANT_SENTINEL_INSTRUCTION_FROM_DYNAMIC_TOOLSET',
+    )
+
+    @toolset.tool_plain
+    def dynamic_tool() -> str:
+        """A tool inside the dynamic toolset."""
+        return 'done'
+
+    return toolset
+
+
+dynamic_toolset_instructions_temporal_agent = TemporalAgent(
+    dynamic_toolset_instructions_agent,
+    activity_config=BASE_ACTIVITY_CONFIG,
+)
+
+
+@workflow.defn
+class DynamicToolsetInstructionsWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await dynamic_toolset_instructions_temporal_agent.run(prompt)
+        return result.output
+
+
+async def test_dynamic_toolset_instructions_in_workflow(client: Client):
+    """Instructions from a dynamic toolset should propagate through Temporal activities."""
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[DynamicToolsetInstructionsWorkflow],
+        plugins=[AgentPlugin(dynamic_toolset_instructions_temporal_agent)],
+    ):
+        output = await client.execute_workflow(
+            DynamicToolsetInstructionsWorkflow.run,
+            args=['Use the dynamic toolset instructions'],
+            id=DynamicToolsetInstructionsWorkflow.__name__,
+            task_queue=TASK_QUEUE,
+        )
+        assert output == snapshot('IMPORTANT_SENTINEL_INSTRUCTION_FROM_DYNAMIC_TOOLSET:done')
+
+
+def return_fastmcp_dynamic_toolset_result(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    if len(messages) == 1:
+        return ModelResponse(parts=[ToolCallPart('fastmcp_ping', {})])
+
+    last_message = messages[-1]
+    assert isinstance(last_message, ModelRequest)
+    tool_return = last_message.parts[0]
+    assert isinstance(tool_return, ToolReturnPart)
+    return ModelResponse(parts=[TextPart(f'{agent_info.instructions or "NO_INSTRUCTIONS"}:{tool_return.content}')])
+
+
+def build_fastmcp_server() -> Any:
+    # Keep FastMCP out of workflow sandbox validation; the server is only built inside activities.
+    from fastmcp.server import FastMCP
+
+    server = FastMCP('dynamic-fastmcp')
+
+    @server.tool
+    def fastmcp_ping() -> str:
+        """Return a fixed value from a local FastMCP server."""
+        return 'pong'
+
+    return server
+
+
+fastmcp_dynamic_toolset_agent = Agent(
+    FunctionModel(return_fastmcp_dynamic_toolset_result), name='fastmcp_dynamic_toolset_agent'
+)
+
+
+@fastmcp_dynamic_toolset_agent.toolset(id='fastmcp_toolset')
+def my_fastmcp_dynamic_toolset(ctx: RunContext[None]) -> FastMCPToolset[None]:
+    return FastMCPToolset(build_fastmcp_server(), id='fastmcp')
+
+
+fastmcp_dynamic_toolset_temporal_agent = TemporalAgent(
+    fastmcp_dynamic_toolset_agent,
+    activity_config=BASE_ACTIVITY_CONFIG,
+)
+
+
+@workflow.defn
+class FastMCPDynamicToolsetWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await fastmcp_dynamic_toolset_temporal_agent.run(prompt)
+        return result.output
+
+
+async def test_fastmcp_dynamic_toolset_without_instructions_in_workflow(client: Client):
+    """FastMCP dynamic toolsets should not fetch instructions unless enabled."""
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[FastMCPDynamicToolsetWorkflow],
+        plugins=[AgentPlugin(fastmcp_dynamic_toolset_temporal_agent)],
+    ):
+        output = await client.execute_workflow(
+            FastMCPDynamicToolsetWorkflow.run,
+            args=['Use the local FastMCP tool'],
+            id=FastMCPDynamicToolsetWorkflow.__name__,
+            task_queue=TASK_QUEUE,
+        )
+        assert output == snapshot('NO_INSTRUCTIONS:pong')
+
+
 # --- MCP-based DynamicToolset test ---
 # Tests that @agent.toolset with an MCP toolset works with Temporal workflows.
 # Uses MCPServerStreamableHTTP (HTTP-based) rather than subprocess-based MCP servers.
@@ -2498,12 +2630,8 @@ async def test_custom_model_settings(allow_model_requests: None, client: Client)
         assert output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
 
 
-def return_mcp_instructions(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
-    return ModelResponse(parts=[TextPart(agent_info.instructions or '')])
-
-
 mcp_instructions_agent = Agent(
-    FunctionModel(return_mcp_instructions),
+    FunctionModel(return_instructions),
     name='mcp_instructions_agent',
     toolsets=[MCPServerStdio('python', ['-m', 'tests.mcp_server'], include_instructions=True, id='mcp')],
 )
